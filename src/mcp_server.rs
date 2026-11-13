@@ -142,11 +142,7 @@ impl McpServer {
     /// `_meta`.
     pub async fn run(self) -> Result<()> {
         let (stdin, stdout) = rmcp::transport::stdio();
-        let service = McpHandler(Arc::new(self))
-            .serve(line_limited_transport(stdin, stdout, MAX_LINE_LENGTH))
-            .await?;
-        service.waiting().await?;
-        Ok(())
+        serve_until_closed(self, stdin, stdout, MAX_LINE_LENGTH).await
     }
 
     /// The MCP tool catalogue, built once from its JSON definitions.
@@ -982,6 +978,36 @@ const ID_SALVAGE_PREFIX: usize = 64 * 1024;
 
 /// Builds the server's transport over `read`/`write`, answering any message
 /// longer than `max_line` bytes with a JSON-RPC Invalid Request error.
+/// Serves `server` over a line-delimited byte stream until the client leaves.
+///
+/// Input ending before any client lifecycle starts is a clean exit: rmcp
+/// reports it as [`ServerInitializeError::ConnectionClosed`], which in rmcp
+/// 3.9.0 arises only while waiting for the first lifecycle-selecting message
+/// (an `initialize` request, or a request carrying complete inline metadata).
+/// That is a host starting the server and then shutting it down unused, not a
+/// failure. Every other initialisation error still propagates.
+async fn serve_until_closed<R, W>(
+    server: McpServer,
+    read: R,
+    write: W,
+    max_line: usize,
+) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let service = match McpHandler(Arc::new(server))
+        .serve(line_limited_transport(read, write, max_line))
+        .await
+    {
+        Ok(service) => service,
+        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    service.waiting().await?;
+    Ok(())
+}
+
 fn line_limited_transport<R, W>(read: R, write: W, max_line: usize) -> LineLimitedTransport<R, W>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -1518,5 +1544,65 @@ mod tests {
         let entries = result["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["content"], "hello");
+    }
+
+    /// Runs [`serve_until_closed`] over an in-memory pipe whose client side
+    /// writes `input`, closes, and reads every reply until the server exits.
+    async fn serve_input(input: &str) -> (Result<()>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (config, _palace) = setup_test();
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let (mut client_read, mut client_write) = tokio::io::split(client_io);
+        client_write.write_all(input.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+        drop(client_write);
+        let server = McpServer::new_test(config);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            serve_until_closed(server, server_read, server_write, MAX_LINE_LENGTH),
+        )
+        .await
+        .expect("server did not exit after its input ended");
+        let mut output = String::new();
+        client_read.read_to_string(&mut output).await.unwrap();
+        (result, output)
+    }
+
+    #[tokio::test]
+    async fn input_ending_before_any_message_is_a_clean_exit() {
+        let (result, output) = serve_input("").await;
+        assert!(
+            result.is_ok(),
+            "unused shutdown reported as failure: {result:?}"
+        );
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn input_ending_after_a_pre_lifecycle_ping_is_a_clean_exit() {
+        let (result, output) =
+            serve_input("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n").await;
+        assert!(
+            result.is_ok(),
+            "unused shutdown reported as failure: {result:?}"
+        );
+        let reply: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(reply["id"], 1);
+        assert!(reply["result"].is_object());
+    }
+
+    #[tokio::test]
+    async fn other_initialisation_errors_still_fail() {
+        let (result, _) =
+            serve_input("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await;
+        let err = result.expect_err("a notification before any request must fail");
+        assert!(
+            matches!(
+                err.downcast_ref::<rmcp::service::ServerInitializeError>(),
+                Some(rmcp::service::ServerInitializeError::ExpectedInitializeRequest(_))
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 }
