@@ -1,14 +1,11 @@
-use std::env;
 use std::process::Command;
 
 #[test]
 fn test_help_command() {
-    let mut path = env::current_exe().unwrap();
-    path.pop(); // Pop off the test executable
-    path.pop(); // Pop off deps
-    path.push("mempalace-rs");
-
-    let output = Command::new(path)
+    // Cargo builds the package's binaries before its integration tests and
+    // gives each test its path, wherever the toolchain lays out the target
+    // directory.
+    let output = Command::new(env!("CARGO_BIN_EXE_mempalace-rs"))
         .arg("--help")
         .output()
         .expect("failed to execute process");
