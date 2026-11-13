@@ -982,7 +982,7 @@ const ID_SALVAGE_PREFIX: usize = 64 * 1024;
 ///
 /// Input ending before any client lifecycle starts is a clean exit: rmcp
 /// reports it as [`ServerInitializeError::ConnectionClosed`], which in rmcp
-/// 3.9.0 arises only while waiting for the first lifecycle-selecting message
+/// 3.10.0 arises only while waiting for the first lifecycle-selecting message
 /// (an `initialize` request, or a request carrying complete inline metadata).
 /// That is a host starting the server and then shutting it down unused, not a
 /// failure. Every other initialisation error still propagates.
